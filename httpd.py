@@ -64,7 +64,8 @@ class Worker:
                 logging.info('Answer sent successfully')
 
             except Exception as e:
-                logging.error(e)
+                raise e
+                # logging.error(e)
             finally:
                 try:
                     connection.close()
@@ -76,19 +77,15 @@ class Worker:
     @classmethod
     def get_request(cls, connection):
         raw_data = b''
-        parsed_request = None
         while True:
             try:
                 chunk = connection.recv(BUFFSIZE)
-                if not chunk:
-                    break
                 raw_data += chunk
-                parsed_request = parse_request(raw_data.decode())
-                if parsed_request:
+                if not chunk or len(chunk) < BUFFSIZE:
                     break
             except Exception as e:
-                logging.error(e)
                 break
+        parsed_request = parse_request(raw_data.decode())
         return parsed_request, raw_data
 
     @classmethod

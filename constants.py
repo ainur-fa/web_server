@@ -5,7 +5,7 @@ OK = 200
 NOT_FOUND = 404
 METHOD_NOT_ALLOWED = 405
 
-DEFAULT_CONFIG = {'WORKERS': 5,
+DEFAULT_CONFIG = {'WORKERS': 20,
                   'SOCKET_TIMEOUT': 30,
                   'BUFFSIZE': 1024,
                   'ROOT_DIR': 'httptest',

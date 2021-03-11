@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
-from constants import *
+from constants import RESPONSE_HEADERS, OK
 
 CRLF = b'\r\n'
 
@@ -19,11 +19,14 @@ class Response:
                   f'Date: {datetime.today().strftime("%a, %d %b %Y %H:%M:%S %Z")}'.encode(),
                   b'Server: MyTestServer',
                   b'Connection: close', ]
-        if self.content:
+        if self.code == OK:
             report.extend([f'Content-Length: {self.lengt}'.encode(),
                            f'Content-Type: {self.mime_type}'.encode()])
 
-        report.append(CRLF + self.content) if self.method == 'GET' else report.append(CRLF)
+            if self.method == 'GET':
+                report.append(CRLF + self.content)
+
+        report.append(CRLF)
         return CRLF.join(report)
 
 

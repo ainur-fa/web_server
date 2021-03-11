@@ -9,8 +9,8 @@ from pathlib import Path
 from collections import namedtuple
 import queue
 from threading import Thread
-from responses import *
-from constants import *
+from responses import Response, NOTFOUND_RESPONSE, OTHER_RESPONSE
+from constants import OK, MIME_TYPES, DEFAULT_CONFIG
 
 logging.basicConfig(level=logging.INFO,
                     format='[%(asctime)s] %(levelname).1s [%(threadName)s] %(message)s',
@@ -24,7 +24,7 @@ SOCKET_TIMEOUT = DEFAULT_CONFIG['SOCKET_TIMEOUT']
 PATTERN = re.compile(r'(?P<method>[A-Z]*?)\s*(?P<resource>\S+)\sHTTP/1.(1|0).*\r\n\r\n', re.DOTALL)
 
 
-def init_config():
+def get_workers_count():
     """Init configuration"""
     ap = argparse.ArgumentParser()
     ap.add_argument("-w", metavar='<path>', dest='workers_count', help="workers count",
@@ -32,7 +32,7 @@ def init_config():
     return int(ap.parse_args().workers_count)
 
 
-WORKERS = init_config()
+WORKERS = get_workers_count()
 
 
 def parse_request(request):
@@ -42,19 +42,18 @@ def parse_request(request):
 
 class Worker:
 
-    @classmethod
-    def main_handler(cls, queue):
+    def main_handler(self, queue):
         logging.info('Thread started')
         while True:
             connection = queue.get()
             logging.info('NEW TASK STARTED')
             try:
-                parsed_request, raw_data = cls.get_request(connection)
+                parsed_request, raw_data = self.get_request(connection)
                 logging.info(f'Received request: {raw_data}')
                 logging.info(f'Parsed request: {parsed_request}')
 
                 if parsed_request:
-                    answer = cls.router(parsed_request)
+                    answer = self.router(parsed_request)
                     logging.info('CORRECT REQUEST')
                 else:
                     answer = OTHER_RESPONSE.make_answer()
@@ -65,7 +64,6 @@ class Worker:
 
             except Exception as e:
                 raise e
-                # logging.error(e)
             finally:
                 try:
                     connection.close()
@@ -74,30 +72,27 @@ class Worker:
             queue.task_done()
             logging.info('TASK_DONE')
 
-    @classmethod
-    def get_request(cls, connection):
+    def get_request(self, connection):
         raw_data = b''
         while True:
             try:
                 chunk = connection.recv(BUFFSIZE)
                 raw_data += chunk
-                if not chunk or len(chunk) < BUFFSIZE:
+                if not chunk or b'\r\n\r\n' in chunk:
                     break
             except Exception as e:
                 break
         parsed_request = parse_request(raw_data.decode())
         return parsed_request, raw_data
 
-    @classmethod
-    def get_file_data(cls, file):
+    def get_file_data(self, file):
         file = Path(file).resolve()
         content = Path(file).read_bytes() if file.is_file() else (Path(file) / 'index.html').read_bytes()
         length = len(content)
         extension = Path(file).suffix[1:]
         return namedtuple('file', ['content', 'length', 'extension'])(content, length, extension)
 
-    @classmethod
-    def validate_resource(cls, resource):
+    def validate_resource(self, resource):
         resource = resource.split('?')[0][1:]  # without args and first "/"
         resource_path = Path(resource).resolve()
 
@@ -111,23 +106,24 @@ class Worker:
         logging.info(f'Requested file "{resource_path}" FOUND')
         return str(resource_path)
 
-    @classmethod
-    def method_handler(cls, method, resource: str):
-        valid_resourse = cls.validate_resource(resource)
+    def method_handler(self, method, resource: str):
+        valid_resourse = self.validate_resource(resource)
         if not valid_resourse:
             logging.info('Requested file is not allowed or not exist')
             return NOTFOUND_RESPONSE
 
-        file = cls.get_file_data(valid_resourse)
-        content_type = MIME_TYPES.get(file.extension)
-        return Response(code=OK, content=file.content, lengt=file.length, mime_type=content_type, method=method)
+        file = self.get_file_data(valid_resourse)
+        return Response(code=OK,
+                        content=file.content if method == 'GET' else None,
+                        lengt=file.length,
+                        mime_type=MIME_TYPES.get(file.extension),
+                        method=method)
 
-    @classmethod
-    def router(cls, parsed_request):
+    def router(self, parsed_request):
         available_methods = ('GET', 'HEAD')
         method, resource = parsed_request.values()
         if method in available_methods:
-            response = cls.method_handler(method, unquote(resource))
+            response = self.method_handler(method, unquote(resource))
             report = response.make_answer()
         else:
             logging.info(f'Method "{method}" is not allowed')
@@ -135,20 +131,10 @@ class Worker:
         return report
 
 
-class Munufacture:
-
-    def __init__(self, workers):
-        self.queue = queue.Queue(workers)
-        [self._run_worker() for _ in range(workers)]
-
-    def add_task(self, task):
-        self.queue.put(task)
-
-    def wait_task(self):
-        self.queue.join()
-
-    def _run_worker(self):
-        this_thread = Thread(target=Worker.main_handler, args=(self.queue,), daemon=False)
+def run_workers(count, clients_queue):
+    worker = Worker()
+    for _ in range(count):
+        this_thread = Thread(target=worker.main_handler, args=(clients_queue,), daemon=False)
         this_thread.start()
 
 
@@ -158,7 +144,8 @@ def main():
     logging.info('Starting server in {}:{} with {} worker(s)'.format(HOST, PORT, WORKERS))
     sock.bind((HOST, PORT))
     sock.listen(WORKERS)
-    tasks_queue = Munufacture(WORKERS)
+    clients_queue = queue.Queue(WORKERS)
+    run_workers(WORKERS, clients_queue)
 
     try:
         while True:
@@ -166,10 +153,10 @@ def main():
             connection, client_address = sock.accept()
             connection.settimeout(SOCKET_TIMEOUT)
             logging.info('Connected to: %s', client_address)
-            tasks_queue.add_task(connection)
+            clients_queue.put(connection)
     except KeyboardInterrupt:
         sock.close()
-        tasks_queue.wait_task()
+        clients_queue.join()
 
 
 if __name__ == '__main__':

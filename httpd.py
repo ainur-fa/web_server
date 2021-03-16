@@ -5,34 +5,47 @@ from urllib.parse import unquote
 import re
 import logging
 import argparse
+import configparser
 from pathlib import Path
-from collections import namedtuple
 import queue
 from threading import Thread
 from responses import Response, NOTFOUND_RESPONSE, OTHER_RESPONSE
-from constants import OK, MIME_TYPES, DEFAULT_CONFIG
+from constants import OK, MIME_TYPES
 
 logging.basicConfig(level=logging.INFO,
                     format='[%(asctime)s] %(levelname).1s [%(threadName)s] %(message)s',
                     datefmt='%Y.%m.%d %H:%M:%S')
 
-HOST = DEFAULT_CONFIG['HOST']
-PORT = DEFAULT_CONFIG['PORT']
-ROOT_DIR = DEFAULT_CONFIG['ROOT_DIR']
-BUFFSIZE = DEFAULT_CONFIG['BUFFSIZE']
-SOCKET_TIMEOUT = DEFAULT_CONFIG['SOCKET_TIMEOUT']
 PATTERN = re.compile(r'(?P<method>[A-Z]*?)\s*(?P<resource>\S+)\sHTTP/1.(1|0).*\r\n\r\n', re.DOTALL)
 
 
-def get_workers_count():
+def init_config():
     """Init configuration"""
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-w", metavar='<path>', dest='workers_count', help="workers count",
-                    default=DEFAULT_CONFIG['WORKERS'])
-    return int(ap.parse_args().workers_count)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", metavar='<path>', dest='config', help="path to config file", default='settings.ini')
+    conf_file = parser.parse_args().config
+
+    if not Path(conf_file).exists():
+        raise Exception('Config file not found')
+
+    return conf_file
 
 
-WORKERS = get_workers_count()
+def parse_config(conf_file):
+    """Parsig configuration file"""
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(conf_file)
+        cp_section = cp['config']
+        host = cp_section.get('HOST')
+        port = int(cp_section.get('PORT'))
+        root_dir = cp_section.get('ROOT_DIR')
+        buffsize = int(cp_section.get('BUFFSIZE'))
+        socket_timeout = int(cp_section.get('SOCKET_TIMEOUT'))
+        workers = int(cp_section.get('WORKERS'))
+        return host, port, root_dir, buffsize, socket_timeout, workers
+    except:
+        raise Exception('Config file parsing error')
 
 
 def parse_request(request):
@@ -40,20 +53,61 @@ def parse_request(request):
     return math.groupdict() if math else None
 
 
-class Worker:
+def get_request(connection, buffsize):
+    raw_data = b''
+    while True:
+        try:
+            chunk = connection.recv(buffsize)
+            raw_data += chunk
+            if not chunk or b'\r\n\r\n' in chunk:
+                break
+        except Exception as e:
+            break
+    return raw_data
 
-    def main_handler(self, queue):
+
+def validate_path(path, root_dir):
+    resource = unquote(path).split('?')[0][1:]  # without args and first "/"
+    resource_path = Path(resource).resolve()
+
+    if any([resource_path.is_file() and resource.endswith('/'),
+            not resource_path.exists(),
+            Path(root_dir).resolve() not in resource_path.parents,
+            resource_path.is_dir() and not resource_path.joinpath('index.html').exists(),
+            ]):
+        return False
+
+    logging.info(f'Requested file "{resource_path}" FOUND')
+    return resource_path if resource_path.is_file() else resource_path / 'index.html'
+
+
+class RequestHandler:
+
+    available_methods = ('GET', 'HEAD')
+
+    def __init__(self, clients_queue, buffsize, root_dir):
+        self.queue = clients_queue
+        self.buffsize = buffsize
+        self.root_dir = root_dir
+        self.method = None
+        self.resource = None
+
+    def run(self):
         logging.info('Thread started')
+
         while True:
-            connection = queue.get()
+            connection = self.queue.get()
             logging.info('NEW TASK STARTED')
             try:
-                parsed_request, raw_data = self.get_request(connection)
+                raw_data = get_request(connection, self.buffsize)
                 logging.info(f'Received request: {raw_data}')
+
+                parsed_request = parse_request(raw_data.decode())
                 logging.info(f'Parsed request: {parsed_request}')
 
                 if parsed_request:
-                    answer = self.router(parsed_request)
+                    self.method, self.resource = parsed_request.values()
+                    answer = self.make_report()
                     logging.info('CORRECT REQUEST')
                 else:
                     answer = OTHER_RESPONSE.make_answer()
@@ -69,83 +123,43 @@ class Worker:
                     connection.close()
                 except Exception as e:
                     logging.error(f'Error closing connection: {e}')
-            queue.task_done()
+            self.queue.task_done()
             logging.info('TASK_DONE')
 
-    def get_request(self, connection):
-        raw_data = b''
-        while True:
-            try:
-                chunk = connection.recv(BUFFSIZE)
-                raw_data += chunk
-                if not chunk or b'\r\n\r\n' in chunk:
-                    break
-            except Exception as e:
-                break
-        parsed_request = parse_request(raw_data.decode())
-        return parsed_request, raw_data
+    def make_report(self):
+        if self.method in self.available_methods:
+            response = self.make_response()
+            report = response.make_answer()
+        else:
+            logging.info(f'Method "{self.method}" is not allowed')
+            report = OTHER_RESPONSE.make_answer()
+        return report
 
-    def get_file_data(self, file):
-        file = Path(file).resolve()
-        content = Path(file).read_bytes() if file.is_file() else (Path(file) / 'index.html').read_bytes()
-        length = len(content)
-        extension = Path(file).suffix[1:]
-        return namedtuple('file', ['content', 'length', 'extension'])(content, length, extension)
-
-    def validate_resource(self, resource):
-        resource = resource.split('?')[0][1:]  # without args and first "/"
-        resource_path = Path(resource).resolve()
-
-        if any([resource_path.is_file() and resource.endswith('/'),
-                not resource_path.exists(),
-                Path(ROOT_DIR).resolve() not in resource_path.parents,
-                resource_path.is_dir() and not resource_path.joinpath('index.html').exists(),
-                ]):
-            return False
-
-        logging.info(f'Requested file "{resource_path}" FOUND')
-        return str(resource_path)
-
-    def method_handler(self, method, resource: str):
-        valid_resourse = self.validate_resource(resource)
+    def make_response(self):
+        valid_resourse = validate_path(unquote(self.resource), self.root_dir)
         if not valid_resourse:
             logging.info('Requested file is not allowed or not exist')
             return NOTFOUND_RESPONSE
 
-        file = self.get_file_data(valid_resourse)
         return Response(code=OK,
-                        content=file.content if method == 'GET' else None,
-                        lengt=file.length,
-                        mime_type=MIME_TYPES.get(file.extension),
-                        method=method)
-
-    def router(self, parsed_request):
-        available_methods = ('GET', 'HEAD')
-        method, resource = parsed_request.values()
-        if method in available_methods:
-            response = self.method_handler(method, unquote(resource))
-            report = response.make_answer()
-        else:
-            logging.info(f'Method "{method}" is not allowed')
-            report = OTHER_RESPONSE.make_answer()
-        return report
-
-
-def run_workers(count, clients_queue):
-    worker = Worker()
-    for _ in range(count):
-        this_thread = Thread(target=worker.main_handler, args=(clients_queue,), daemon=False)
-        this_thread.start()
+                        content=valid_resourse.read_bytes() if self.method == 'GET' else None,
+                        lengt=valid_resourse.stat().st_size,
+                        mime_type=MIME_TYPES.get(valid_resourse.suffix[1:]),
+                        method=self.method)
 
 
 def main():
+    HOST, PORT, ROOT_DIR, BUFFSIZE, SOCKET_TIMEOUT, WORKERS = parse_config(init_config())
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    logging.info('Starting server in {}:{} with {} worker(s)'.format(HOST, PORT, WORKERS))
     sock.bind((HOST, PORT))
     sock.listen(WORKERS)
+    logging.info('Starting server in {}:{} with {} worker(s)'.format(HOST, PORT, WORKERS))
+
     clients_queue = queue.Queue(WORKERS)
-    run_workers(WORKERS, clients_queue)
+    for _ in range(WORKERS):
+        this_thread = Thread(target=RequestHandler(clients_queue, BUFFSIZE, ROOT_DIR).run, daemon=False)
+        this_thread.start()
 
     try:
         while True:
